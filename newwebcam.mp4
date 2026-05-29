@@ -1,0 +1,198 @@
+import os
+import time
+import tkinter as tk
+from pathlib import Path
+
+import cv2
+from PIL import Image, ImageOps, ImageTk
+
+CAMERA_INDEX = 0
+INITIAL_SIZE = "640x480"
+MIN_WIDTH = 320
+MIN_HEIGHT = 240
+FRAME_DELAY_MS = 15
+F11_MAXIMIZE_GRACE_SECONDS = 1.0
+
+try:
+    RESAMPLE_FILTER = Image.Resampling.LANCZOS
+except AttributeError:  # Pillow < 9.1
+    RESAMPLE_FILTER = Image.LANCZOS
+
+
+class WebcamWindow:
+    def __init__(self):
+        self.window = tk.Tk()
+        self.window.title("Webcam - Resizable")
+        self.window.geometry(INITIAL_SIZE)
+        self.window.minsize(MIN_WIDTH, MIN_HEIGHT)
+        self.window.resizable(True, True)
+        self.window.configure(bg="black")
+
+        self.video = tk.Label(
+            self.window,
+            bg="black",
+            fg="white",
+            text="Opening camera...",
+            anchor="center",
+        )
+        self.video.pack(fill="both", expand=True)
+
+        self.camera = self.open_camera(CAMERA_INDEX)
+        self.current_frame = None
+        self.photo = None
+        self.fullscreen = False
+        self.ignore_zoom_until = 0.0
+        self.after_id = None
+
+        self.set_icon_if_available()
+        self.window.bind("<Configure>", self.on_configure)
+        self.window.bind("<F11>", self.maximize_with_f11)
+        self.window.bind("<Escape>", self.leave_fullscreen)
+        self.window.protocol("WM_DELETE_WINDOW", self.close)
+
+    def open_camera(self, camera_index):
+        backends = []
+        if os.name == "nt":
+            backends.append(cv2.CAP_DSHOW)
+        backends.append(None)
+
+        for backend in backends:
+            camera = (
+                cv2.VideoCapture(camera_index, backend)
+                if backend is not None
+                else cv2.VideoCapture(camera_index)
+            )
+            if camera.isOpened():
+                camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                return camera
+            camera.release()
+
+        return None
+
+    def set_icon_if_available(self):
+        locations = [
+            Path(__file__).with_name("faratar.png"),
+            Path.cwd() / "faratar.png",
+            Path.home() / "faratar.png",
+        ]
+        for icon_path in locations:
+            if icon_path.exists():
+                try:
+                    self.icon_image = tk.PhotoImage(file=str(icon_path))
+                    self.window.iconphoto(True, self.icon_image)
+                    return
+                except tk.TclError:
+                    pass
+
+    def run(self):
+        self.update_frame()
+        self.window.mainloop()
+
+    def update_frame(self):
+        if self.camera is None:
+            self.video.configure(text="Could not open camera 0")
+            self.after_id = self.window.after(500, self.update_frame)
+            return
+
+        ok, frame = self.camera.read()
+        if ok:
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            self.current_frame = Image.fromarray(rgb_frame)
+            self.video.configure(text="")
+            self.draw_frame()
+        else:
+            self.video.configure(text="No camera frame")
+
+        self.after_id = self.window.after(FRAME_DELAY_MS, self.update_frame)
+
+    def draw_frame(self):
+        if self.current_frame is None:
+            return
+
+        width = max(self.video.winfo_width(), 1)
+        height = max(self.video.winfo_height(), 1)
+        if width <= 1 or height <= 1:
+            return
+
+        # Fill the whole window; crop edges only when the aspect ratios differ.
+        fitted = ImageOps.fit(
+            self.current_frame,
+            (width, height),
+            method=RESAMPLE_FILTER,
+            centering=(0.5, 0.5),
+        )
+
+        self.photo = ImageTk.PhotoImage(fitted)
+        self.video.configure(image=self.photo)
+
+    def on_configure(self, event):
+        if event.widget is not self.window:
+            return
+
+        self.draw_frame()
+        if self.fullscreen:
+            return
+
+        # Tk does not expose a separate maximize-button event, so convert an
+        # unsuppressed zoomed state into fullscreen.
+        if self.is_zoomed() and time.monotonic() >= self.ignore_zoom_until:
+            self.set_fullscreen(True)
+
+    def is_zoomed(self):
+        try:
+            if self.window.state() == "zoomed":
+                return True
+        except tk.TclError:
+            pass
+
+        try:
+            return bool(self.window.attributes("-zoomed"))
+        except tk.TclError:
+            return False
+
+    def maximize_with_f11(self, _event=None):
+        self.ignore_zoom_until = time.monotonic() + F11_MAXIMIZE_GRACE_SECONDS
+        if self.fullscreen:
+            self.set_fullscreen(False)
+
+        try:
+            self.window.state("zoomed")
+        except tk.TclError:
+            try:
+                self.window.attributes("-zoomed", True)
+            except tk.TclError:
+                screen_width = self.window.winfo_screenwidth()
+                screen_height = self.window.winfo_screenheight()
+                self.window.geometry(f"{screen_width}x{screen_height}+0+0")
+        return "break"
+
+    def set_fullscreen(self, enabled):
+        self.fullscreen = enabled
+        self.window.attributes("-fullscreen", enabled)
+        if not enabled:
+            try:
+                self.window.state("normal")
+            except tk.TclError:
+                pass
+
+    def leave_fullscreen(self, _event=None):
+        if self.fullscreen:
+            self.set_fullscreen(False)
+        return "break"
+
+    def close(self):
+        if self.after_id is not None:
+            try:
+                self.window.after_cancel(self.after_id)
+            except tk.TclError:
+                pass
+
+        if self.camera is not None:
+            self.camera.release()
+        cv2.destroyAllWindows()
+        self.window.destroy()
+
+
+if __name__ == "__main__":
+    WebcamWindow().run()
